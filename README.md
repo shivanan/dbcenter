@@ -40,12 +40,30 @@ Driver API references: [libpq](https://www.postgresql.org/docs/current/libpq.htm
 3. Save and connect. Registered servers appear together in the sidebar with engine icons and connection indicators.
 4. Select any server to connect. Switching servers keeps each session, editor draft, result, and in-memory query history alive.
 5. Use the native database combo box to select a discovered database or type a database name and press Return. The inspector lists tables/views, collections, a first scan of Redis keys, or Influx measurements.
-6. Run the editor contents with **⌘Return**. Results support native row selection, **⌘C**, column resizing, and CSV export. MongoDB replies and Influx CSV also have a Raw view.
+6. Run the editor contents with **⌘Return**. Click a result cell and press **⌘C** to copy its complete value, without column headers. The selected cell is highlighted; arrow keys move between cells. Click a row number (or use Shift/Command-click) for native row selection and row copying; **⌘A** selects all rows. Results also support column resizing and CSV or JSON export from the Results export menu. NULL cells copy as `NULL`; empty cells copy as an empty string. MongoDB replies and Influx CSV also have a Raw view.
 7. Use the sidebar context menu to edit, disconnect, or remove a registration. Removing a registration never deletes a database.
 
 Passwords and tokens are stored in macOS Keychain. Connection metadata is written atomically to `~/Library/Application Support/DBCenter/servers.json`. Query text and results remain in memory and are not persisted across app launches. Nothing is sent to a telemetry service.
 
 TLS is enabled by default for Postgres, SQL Server, MongoDB, and InfluxDB, with certificate validation. Turn it off explicitly for local servers that do not use TLS. Redis currently supports TCP only. Host fields take a hostname or IP address, not a URI. MongoDB SRV URIs, custom CA selection, client certificates, SSH tunnels, and Windows integrated authentication are not implemented.
+
+## Keyboard shortcuts
+
+Focus commands are available in the macOS **Navigate** menu and in control tooltips. **⌥** is Option; **⌘** is Command.
+
+| Shortcut | Action |
+| --- | --- |
+| **⌥⌘1** | Focus the database selector and select its text. Type a name and press Return, or use the native dropdown's arrow keys. |
+| **⌥⌘2** | Focus the query editor, preserving its insertion point and selection. |
+| **⌥⌘3** | Focus the inspector's table/object search and select its text. Opens the inspector if hidden. This filters table, collection, key, or measurement names. |
+| **⌥⌘4** | Focus the result grid. Switches Raw to Grid and selects the first cell if none is selected. Arrow keys then move between cells; ⌘C copies the selected value. |
+| **⌘Return** | Run query. |
+| **⇧⌘R** | Refresh database objects. |
+| **⇧⌘N** | Add a connection. |
+| **⌘C** | Copy the selected result cell, or selected rows in row-selection mode. |
+| **⌘A** | Select all rows when the result grid has focus. |
+
+Focus commands apply to the active server workspace and are disabled while editing a connection. Database focus is available when connected and idle; result-grid focus requires a tabular result and is unavailable during a query or an error. The table search text is retained when the inspector is hidden and reopened.
 
 ## Query examples
 
@@ -81,6 +99,10 @@ from(bucket: "metrics")
   |> limit(n: 100)
 ```
 
+## Export formats
+
+The Results export menu offers **Export as CSV…** and **Export as JSON…**, each using the native save dialog. Both export the currently displayed result rows. JSON contains `columns`, positional `rows`, `affectedRows`, and `truncated`. This preserves column order and duplicate column names. Cell values remain strings as returned by the result model, with database NULL values encoded as JSON `null`; nested MongoDB values remain their displayed JSON strings.
+
 ## Current boundaries
 
 - InfluxDB support targets **2.x/Flux**. InfluxDB 1/InfluxQL and 3/SQL are not implemented. HTTP requests are used because this engine exposes an HTTP query API, rather than a native C client.
@@ -112,7 +134,7 @@ The script starts disposable servers in temporary directories, binds only to loo
 Verified in this workspace:
 
 - Debug and release compilation and `.app` packaging.
-- All 9 automated tests pass.
+- The original 9 automated tests passed during initial verification; all 3 export tests, 3 cell-selection/copy tests, and 3 native focus-routing tests also pass.
 - Live Postgres: queries, Unicode, NULL, errors, session persistence, database/object discovery.
 - Live MongoDB: insert/find commands, Unicode, malformed JSON, collection/database discovery.
 - Live Redis: commands, quoted values, errors, database isolation, database/key discovery.

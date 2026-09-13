@@ -35,7 +35,7 @@ struct Server: Identifiable, Codable, Equatable {
     var authDatabase = "admin"
     var endpoint: String { "\(host):\(port)" }
 }
-struct QueryResult: Sendable {
+struct QueryResult: Sendable, Equatable {
     var columns: [String] = []
     var rows: [[String?]] = []
     var raw: String? = nil

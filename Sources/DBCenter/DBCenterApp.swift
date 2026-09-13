@@ -8,6 +8,7 @@ import SwiftUI
         }
         .defaultSize(width: 1320, height: 840)
         .commands {
+            WorkspaceFocusCommands(store: store)
             CommandGroup(after: .newItem) {
                 Button("New Connection…") { store.editor = Server() }.keyboardShortcut("n", modifiers: [.command, .shift])
             }
@@ -109,6 +110,8 @@ struct WorkspaceView: View {
     @ObservedObject var workspace: Workspace
     @Binding var showInspector: Bool
     @State private var resultMode = "Grid"
+    @StateObject private var focus = WorkspaceFocus()
+    @State private var objectSearch = ""
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
@@ -117,7 +120,7 @@ struct WorkspaceView: View {
                     VStack(alignment: .leading, spacing: 3) { Text(workspace.server.name).font(.headline); Text(workspace.server.endpoint).font(.caption).foregroundStyle(.secondary) }
                     Spacer()
                     Text(workspace.server.engine.databaseLabel).font(.caption).foregroundStyle(.secondary)
-                    DatabaseCombo(value: workspace.database, options: workspace.databases, enabled: workspace.connected && !workspace.busy) { value in Task { await workspace.switchDatabase(value) } }.frame(width: 180, height: 26)
+                    DatabaseCombo(value: workspace.database, options: workspace.databases, enabled: workspace.connected && !workspace.busy, focus: focus) { value in Task { await workspace.switchDatabase(value) } }.frame(width: 180, height: 26)
                 }.padding(18)
                 Divider()
                 VSplitView {
@@ -132,7 +135,7 @@ struct WorkspaceView: View {
                             } else { Button("Connect") { Task { await workspace.connect() } }.buttonStyle(.borderedProminent).disabled(workspace.busy) }
                         }.padding(.horizontal, 16).padding(.vertical, 10).background(.bar)
                         Divider()
-                        QueryEditor(text: $workspace.query) { Task { await workspace.run() } }
+                        QueryEditor(text: $workspace.query, focus: focus) { Task { await workspace.run() } }
                         HStack { Text("\(workspace.query.components(separatedBy: "\n").count) lines"); Spacer(); Text("⌘ ↩  Run query") }.font(.system(size: 10)).foregroundStyle(.tertiary).padding(.horizontal, 18).padding(.vertical, 6)
                     }.frame(minHeight: 180, idealHeight: 300)
                     VStack(spacing: 0) {
@@ -141,7 +144,13 @@ struct WorkspaceView: View {
                             if let result = workspace.result { Text(result.message).font(.caption).foregroundStyle(.secondary) }
                             Spacer()
                             if workspace.result?.raw != nil { Picker("Result format", selection: $resultMode) { Text("Grid").tag("Grid"); Text("Raw").tag("Raw") }.pickerStyle(.segmented).labelsHidden().frame(width: 115) }
-                            Button { export() } label: { Image(systemName: "square.and.arrow.up") }.buttonStyle(.borderless).disabled(workspace.result == nil).help("Export results as CSV")
+                            Menu {
+                                ForEach(ResultExportFormat.allCases, id: \.self) { format in
+                                    Button("Export as \(format.rawValue.uppercased())…") { export(format) }
+                                }
+                            } label: { Image(systemName: "square.and.arrow.up") }
+                            .menuStyle(.borderlessButton).fixedSize().disabled(workspace.result == nil)
+                            .help("Export results as CSV or JSON").accessibilityLabel("Export results")
                         }.padding(.horizontal, 16).padding(.vertical, 11).background(.bar)
                         Divider()
                         if let error = workspace.error {
@@ -151,7 +160,7 @@ struct WorkspaceView: View {
                         } else if let result = workspace.result {
                             if resultMode == "Raw", let raw = result.raw { ScrollView([.horizontal, .vertical]) { Text(raw).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).padding(16).frame(maxWidth: .infinity, alignment: .leading) } }
                             else if result.columns.isEmpty { ContentUnavailableView("Command completed", systemImage: "checkmark.circle", description: Text(result.message)) }
-                            else { ResultGrid(result: result) }
+                            else { ResultGrid(result: result, focus: focus) }
                         } else {
                             ContentUnavailableView("Ready when you are", systemImage: "text.cursor", description: Text("Write a \(workspace.server.engine.language) query above.\nYour results will appear here."))
                         }
@@ -168,24 +177,30 @@ struct WorkspaceView: View {
                     if workspace.connected { Button("Disconnect") { Task { await workspace.disconnect() } }.buttonStyle(.borderless).disabled(workspace.busy) }
                 }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 9).background(.bar)
             }.frame(maxWidth: .infinity)
-            if showInspector { Divider(); InspectorView(workspace: workspace).frame(width: 255) }
+            if showInspector { Divider(); InspectorView(workspace: workspace, search: $objectSearch, focus: focus).frame(width: 255) }
         }.navigationTitle(workspace.server.name).background(Color(nsColor: .textBackgroundColor))
+        .focusedSceneValue(\.workspaceFocusActions, WorkspaceFocusActions(
+            database: workspace.connected && !workspace.busy ? { focus.request(.database) } : nil,
+            editor: { focus.request(.editor) },
+            tableSearch: { showInspector = true; focus.request(.tableSearch) },
+            results: workspace.result?.columns.isEmpty == false && !workspace.busy && workspace.error == nil
+                ? { resultMode = "Grid"; focus.request(.results) } : nil
+        ))
     }
-    private func export() {
+    private func export(_ format: ResultExportFormat) {
         guard let result = workspace.result else { return }
-        let panel = NSSavePanel(); panel.nameFieldStringValue = "query-results.csv"; panel.allowedContentTypes = [.commaSeparatedText]
+        let panel = NSSavePanel(); panel.nameFieldStringValue = "query-results.\(format.rawValue)"; panel.allowedContentTypes = [format.contentType]
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            func escape(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
-            let text = ([result.columns] + result.rows.map { $0.map { $0 ?? "" } }).map { $0.map(escape).joined(separator: ",") }.joined(separator: "\r\n")
-            do { try text.write(to: url, atomically: true, encoding: .utf8) } catch { workspace.error = "Export failed: \(error.localizedDescription)" }
+            do { try format.data(for: result).write(to: url, options: .atomic) } catch { workspace.error = "Export failed: \(error.localizedDescription)" }
         }
     }
 }
 
 struct InspectorView: View {
     @ObservedObject var workspace: Workspace
-    @State private var search = ""
+    @Binding var search: String
+    let focus: WorkspaceFocus
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack { Text("Database Inspector").font(.system(size: 12, weight: .semibold)); Spacer(); Button { Task { await workspace.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.borderless).disabled(workspace.busy || !workspace.connected).help("Refresh objects") }.padding(17)
@@ -200,7 +215,7 @@ struct InspectorView: View {
             }.padding(17)
             Divider()
             HStack { Text(workspace.server.engine.objectLabel).font(.system(size: 12, weight: .semibold)); Spacer(); Text("\(workspace.objects.count)").foregroundStyle(.secondary).font(.caption) }.padding(17)
-            TextField("Filter objects", text: $search).textFieldStyle(.roundedBorder).padding(.horizontal, 14).padding(.bottom, 10)
+            TableSearchField(text: $search, focus: focus).frame(height: 24).padding(.horizontal, 14).padding(.bottom, 10)
             if let error = workspace.metadataError { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled).padding(.horizontal, 16).padding(.bottom, 8) }
             if workspace.objects.isEmpty { Text(workspace.connected ? "No objects to display." : "Connect to explore this database.").font(.caption).foregroundStyle(.secondary).padding(17); Spacer() }
             else {
