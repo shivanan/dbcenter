@@ -3,6 +3,8 @@ import AppKit
 
 struct QueryEditor: NSViewRepresentable {
     @Binding var text: String
+    @Binding var selection: NSRange
+    var engine: Engine = .postgres
     var focus: WorkspaceFocus? = nil
     var run: () -> Void
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -14,24 +16,79 @@ struct QueryEditor: NSViewRepresentable {
         editor.textContainerInset = NSSize(width: 20, height: 18); editor.allowsUndo = true; editor.isVerticallyResizable = true; editor.isHorizontallyResizable = true
         editor.autoresizingMask = [.width]; editor.textContainer?.widthTracksTextView = false; editor.textContainer?.containerSize = NSSize(width: 100000, height: 100000)
         editor.minSize = NSSize(width: 0, height: 0); editor.maxSize = NSSize(width: 100000, height: 100000)
-        editor.delegate = context.coordinator; editor.run = run; editor.string = text; editor.setAccessibilityLabel("Query editor")
+        editor.run = run; editor.string = text; editor.setSelectedRange(selection)
+        editor.delegate = context.coordinator; editor.setAccessibilityLabel("Query editor")
         scroll.documentView = editor; return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? EditorTextView else { return }
+        context.coordinator.isUpdating = true
+        defer { context.coordinator.isUpdating = false }
         editor.run = run
         focus?.register(editor, for: .editor)
         editor.toolTip = "Focus query editor ⌥⌘2"
         if editor.string != text { editor.string = text }
+        if editor.selectedRange() != selection { editor.setSelectedRange(selection) }
+        editor.scheduleHighlighting(engine: engine)
     }
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: QueryEditor
+        var isUpdating = false
         init(_ parent: QueryEditor) { self.parent = parent }
-        func textDidChange(_ notification: Notification) { if let editor = notification.object as? NSTextView { parent.text = editor.string } }
+        func textDidChange(_ notification: Notification) {
+            if !isUpdating, let editor = notification.object as? EditorTextView {
+                let selected = editor.selectedRange()
+                parent.text = editor.string
+                parent.selection = selected
+                editor.scheduleHighlighting(engine: parent.engine)
+            }
+        }
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard !isUpdating, let editor = notification.object as? EditorTextView,
+                  editor.string == parent.text else { return }
+            if parent.selection != editor.selectedRange() { parent.selection = editor.selectedRange() }
+        }
     }
     class EditorTextView: NSTextView {
         var run: (() -> Void)?
+        private var highlightTask: Task<Void, Never>?
+        private var requestedText: String?
+        private var requestedEngine: Engine?
+
+        deinit { highlightTask?.cancel() }
+
+        func scheduleHighlighting(engine: Engine) {
+            let snapshot = string
+            guard requestedText != snapshot || requestedEngine != engine else { return }
+            requestedText = snapshot; requestedEngine = engine
+            highlightTask?.cancel()
+            highlightTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
+                let tokens = await Task.detached(priority: .userInitiated) {
+                    SyntaxHighlighter.tokens(in: snapshot, engine: engine)
+                }.value
+                guard !Task.isCancelled, let self, self.string == snapshot, self.requestedEngine == engine else { return }
+                self.applyHighlighting(tokens)
+            }
+        }
+
+        func applyHighlighting(_ tokens: [SyntaxHighlighter.Token]) {
+            guard let layoutManager else { return }
+            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: (string as NSString).length))
+            for token in tokens {
+                let color: NSColor
+                switch token.kind {
+                case .keyword: color = .systemPurple
+                case .string: color = .systemRed
+                case .comment: color = .secondaryLabelColor
+                case .number: color = .systemBlue
+                case .identifier: color = .systemTeal
+                }
+                layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: token.range)
+            }
+        }
+
         override func keyDown(with event: NSEvent) { if event.modifierFlags.contains(.command) && event.keyCode == 36 { run?() } else { super.keyDown(with: event) } }
     }
 }

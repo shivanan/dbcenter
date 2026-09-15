@@ -98,3 +98,62 @@ final class DriverIntegrationTests: XCTestCase {
         await driver.close()
     }
 }
+
+extension DriverIntegrationTests {
+    func testObjectPreviewAndStructureWithUnusualPostgresNames() async throws {
+        var s = try server(.postgres, port: 15439, database: "postgres"); s.username = "dbcenter_test"
+        let driver = DatabaseDriver(server: s, password: "")
+        try await driver.connect(database: s.database)
+        _ = try await driver.execute("CREATE SCHEMA \"odd.schema\"; CREATE TABLE \"odd.schema\".\"a.b'c\" (id integer NOT NULL, note text DEFAULT 'hello'); INSERT INTO \"odd.schema\".\"a.b'c\" SELECT n, 'value' FROM generate_series(1, 60) AS n;", database: s.database)
+        let objects = try await driver.catalogObjects(database: s.database)
+        let object = try XCTUnwrap(objects.first { $0.schema == "odd.schema" && $0.name == "a.b'c" })
+        let preview = try await driver.previewObject(object, database: s.database)
+        XCTAssertEqual(preview.result.rows.count, 50)
+        let details = try await driver.objectDetails(object, database: s.database)
+        XCTAssertEqual(details[0].result.rows.count, 2)
+        XCTAssertEqual(details[0].result.rows[0][1], "id")
+        XCTAssertEqual(details[0].result.rows[0][6], "NO")
+        await driver.close()
+    }
+    func testMongoObjectPreviewLimitAndCollectionDetails() async throws {
+        let s = try server(.mongo, port: 27029, database: "dbcenter_test")
+        let driver = DatabaseDriver(server: s, password: "")
+        try await driver.connect(database: s.database)
+        let object = DatabaseObject(name: "preview.items")
+        let docs = (1...60).map { "{\"value\":\($0)}" }.joined(separator: ",")
+        _ = try await driver.execute("{\"insert\":\"preview.items\",\"documents\":[\(docs)]}", database: s.database)
+        let preview = try await driver.previewObject(object, database: s.database)
+        XCTAssertEqual(preview.result.rows.count, 50)
+        XCTAssertFalse(preview.result.truncated)
+        let details = try await driver.objectDetails(object, database: s.database)
+        XCTAssertTrue(details[0].result.raw?.contains("preview.items") == true)
+        XCTAssertTrue(details[0].result.raw?.contains("options") == true)
+        await driver.close()
+    }
+}
+
+extension DriverIntegrationTests {
+    func testAISchemaIncludesSQLColumnsButNoRecordValues() async throws {
+        var s = try server(.postgres, port: 15439, database: "postgres"); s.username = "dbcenter_test"
+        let driver = DatabaseDriver(server: s, password: "")
+        try await driver.connect(database: s.database)
+        _ = try await driver.execute("CREATE TABLE ai_context_test (id integer, private_note text); INSERT INTO ai_context_test VALUES (1, 'DO_NOT_SEND_RECORD_CONTENT');", database: s.database)
+        let schema = try await driver.aiSchema(database: s.database)
+        let table = try XCTUnwrap(schema.objects.first { $0.name == "ai_context_test" })
+        XCTAssertEqual(table.columns, ["id", "private_note"])
+        XCTAssertFalse(try schema.json().contains("DO_NOT_SEND_RECORD_CONTENT"))
+        await driver.close()
+    }
+    func testAIMongoSchemaReturnsFieldNamesWithoutValues() async throws {
+        let s = try server(.mongo, port: 27029, database: "ai_context_test")
+        let driver = DatabaseDriver(server: s, password: "")
+        try await driver.connect(database: s.database)
+        _ = try await driver.execute(#"{"insert":"people","documents":[{"name":"DO_NOT_SEND_RECORD_CONTENT","age":30}]}"#, database: s.database)
+        let schema = try await driver.aiSchema(database: s.database)
+        let object = try XCTUnwrap(schema.objects.first { $0.name == "people" })
+        XCTAssertTrue(object.columns.contains("name"))
+        XCTAssertTrue(object.columns.contains("age"))
+        XCTAssertFalse(try schema.json().contains("DO_NOT_SEND_RECORD_CONTENT"))
+        await driver.close()
+    }
+}

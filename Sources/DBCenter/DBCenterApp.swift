@@ -2,9 +2,10 @@ import SwiftUI
 
 @main struct DBCenterApp: App {
     @StateObject private var store = AppStore()
+    @StateObject private var aiSettings = AISettings()
     var body: some Scene {
         Window("DB Center", id: "main") {
-            ContentView().environmentObject(store).frame(minWidth: 980, minHeight: 640)
+            ContentView().environmentObject(store).environmentObject(aiSettings).frame(minWidth: 980, minHeight: 640)
         }
         .defaultSize(width: 1320, height: 840)
         .commands {
@@ -17,6 +18,7 @@ import SwiftUI
                 Button("Refresh Database") { if let id = store.selected, let workspace = store.workspaces[id] { Task { await workspace.refresh() } } }.keyboardShortcut("r", modifiers: [.command, .shift])
             }
         }
+        Settings { AISettingsView().environmentObject(aiSettings) }
     }
 }
 
@@ -107,6 +109,7 @@ struct WelcomeView: View {
 }
 
 struct WorkspaceView: View {
+    @EnvironmentObject private var aiSettings: AISettings
     @ObservedObject var workspace: Workspace
     @Binding var showInspector: Bool
     @State private var resultMode = "Grid"
@@ -130,17 +133,23 @@ struct WorkspaceView: View {
                             Text(workspace.server.engine.language).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).padding(.horizontal, 7).padding(.vertical, 3).background(.quaternary, in: Capsule())
                             Spacer()
                             Menu { ForEach(Array(workspace.history.enumerated()), id: \.offset) { _, query in Button(String(query.prefix(90))) { workspace.query = query } } } label: { Image(systemName: "clock.arrow.circlepath") }.menuStyle(.borderlessButton).frame(width: 24).disabled(workspace.history.isEmpty).help("Query history for this session")
+                            Button { withAnimation { workspace.aiExpanded.toggle() } } label: { Label("AI", systemImage: "sparkles") }
+                                .help("Generate a query with OpenAI").tint(workspace.aiExpanded ? .accentColor : nil)
                             if workspace.connected {
-                                Button { Task { await workspace.run() } } label: { Label(workspace.busy ? "Running…" : "Run Query", systemImage: "play.fill") }.buttonStyle(.borderedProminent).disabled(workspace.busy || workspace.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).help("Run query ⌘↩")
+                                Button { Task { await workspace.run() } } label: { Label(workspace.busy ? "Running…" : workspace.querySelection.length > 0 ? "Run Selection" : "Run Query", systemImage: "play.fill") }.buttonStyle(.borderedProminent).disabled(workspace.busy || workspace.executionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).help("Run selected text, or the entire query if nothing is selected ⌘↩")
                             } else { Button("Connect") { Task { await workspace.connect() } }.buttonStyle(.borderedProminent).disabled(workspace.busy) }
                         }.padding(.horizontal, 16).padding(.vertical, 10).background(.bar)
                         Divider()
-                        QueryEditor(text: $workspace.query, focus: focus) { Task { await workspace.run() } }
-                        HStack { Text("\(workspace.query.components(separatedBy: "\n").count) lines"); Spacer(); Text("⌘ ↩  Run query") }.font(.system(size: 10)).foregroundStyle(.tertiary).padding(.horizontal, 18).padding(.vertical, 6)
+                        if workspace.aiExpanded {
+                            AIQueryPanel(workspace: workspace).environmentObject(aiSettings)
+                            Divider()
+                        }
+                        QueryEditor(text: $workspace.query, selection: $workspace.querySelection, engine: workspace.server.engine, focus: focus) { Task { await workspace.run() } }
+                        HStack { Text("\(workspace.query.components(separatedBy: "\n").count) lines"); Spacer(); Text(workspace.querySelection.length > 0 ? "⌘ ↩  Run selection" : "⌘ ↩  Run query") }.font(.system(size: 10)).foregroundStyle(.tertiary).padding(.horizontal, 18).padding(.vertical, 6)
                     }.frame(minHeight: 180, idealHeight: 300)
                     VStack(spacing: 0) {
                         HStack {
-                            Label("Results", systemImage: "tablecells").font(.system(size: 12, weight: .semibold))
+                            Label(workspace.resultTitle, systemImage: "tablecells").lineLimit(1).font(.system(size: 12, weight: .semibold))
                             if let result = workspace.result { Text(result.message).font(.caption).foregroundStyle(.secondary) }
                             Spacer()
                             if workspace.result?.raw != nil { Picker("Result format", selection: $resultMode) { Text("Grid").tag("Grid"); Text("Raw").tag("Raw") }.pickerStyle(.segmented).labelsHidden().frame(width: 115) }
@@ -179,6 +188,8 @@ struct WorkspaceView: View {
             }.frame(maxWidth: .infinity)
             if showInspector { Divider(); InspectorView(workspace: workspace, search: $objectSearch, focus: focus).frame(width: 255) }
         }.navigationTitle(workspace.server.name).background(Color(nsColor: .textBackgroundColor))
+        .onDisappear { workspace.cancelAI() }
+        .onChange(of: workspace.previewID) { _, _ in resultMode = "Grid" }
         .focusedSceneValue(\.workspaceFocusActions, WorkspaceFocusActions(
             database: workspace.connected && !workspace.busy ? { focus.request(.database) } : nil,
             editor: { focus.request(.editor) },
@@ -198,6 +209,7 @@ struct WorkspaceView: View {
 }
 
 struct InspectorView: View {
+    @State private var detailObject: DatabaseObject?
     @ObservedObject var workspace: Workspace
     @Binding var search: String
     let focus: WorkspaceFocus
@@ -219,11 +231,22 @@ struct InspectorView: View {
             if let error = workspace.metadataError { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled).padding(.horizontal, 16).padding(.bottom, 8) }
             if workspace.objects.isEmpty { Text(workspace.connected ? "No objects to display." : "Connect to explore this database.").font(.caption).foregroundStyle(.secondary).padding(17); Spacer() }
             else {
-                List(workspace.objects.filter { search.isEmpty || $0.localizedCaseInsensitiveContains(search) }, id: \.self) { object in
-                    Label(object, systemImage: workspace.server.engine == .mongo ? "doc.on.doc" : workspace.server.engine == .redis ? "key" : "tablecells").font(.system(size: 12)).lineLimit(1).help(object).textSelection(.enabled)
+                List(workspace.objects.filter { search.isEmpty || $0.displayName.localizedCaseInsensitiveContains(search) }) { object in
+                    HStack(spacing: 6) {
+                        Label(object.displayName, systemImage: workspace.server.engine == .mongo ? "doc.on.doc" : workspace.server.engine == .redis ? "key" : "tablecells")
+                            .font(.system(size: 12)).lineLimit(1).help(object.displayName)
+                        Spacer(minLength: 0)
+                        Button { Task { await workspace.preview(object) } } label: { Image(systemName: "play.fill") }
+                            .help("Preview up to 50 records from \(object.displayName)")
+                            .accessibilityLabel("Preview \(object.displayName)")
+                        Button { detailObject = object } label: { Image(systemName: "info.circle") }
+                            .help("Show structure or details for \(object.displayName)")
+                            .accessibilityLabel("Details for \(object.displayName)")
+                    }.buttonStyle(.borderless).disabled(workspace.busy || !workspace.connected)
                 }.listStyle(.plain)
             }
         }.background(Color(nsColor: .controlBackgroundColor))
+        .sheet(item: $detailObject) { object in ObjectDetailsView(workspace: workspace, object: object) }
     }
     private func info(_ title: String, _ value: String) -> some View { HStack(alignment: .top) { Text(title).foregroundStyle(.secondary); Spacer(); Text(value).lineLimit(2).textSelection(.enabled).multilineTextAlignment(.trailing) }.font(.caption) }
 }
