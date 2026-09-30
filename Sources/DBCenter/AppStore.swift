@@ -48,7 +48,7 @@ import SwiftUI
         guard !busy, value != database, let driver else { return }; cancelAI(); busy = true; error = nil
         defer { busy = false }
         do { try await driver.connect(database: value); database = value; result = nil; await loadObjects() }
-        catch { self.error = error.localizedDescription; connected = false }
+        catch { self.error = error.localizedDescription; connected = false; await driver.close(); self.driver = nil }
     }
     func refresh() async { guard connected, !busy else { return }; busy = true; await loadObjects(); busy = false }
     private func loadObjects() async {
@@ -160,7 +160,10 @@ import SwiftUI
         let workspace = Workspace(server: server); workspaces[server.id] = workspace; return workspace
     }
     func select(_ server: Server) { let workspace = workspace(for: server); selected = server.id; Task { await workspace.connect() } }
-    func save(_ server: Server, password: String) async throws {
+    func save(_ server: Server, password: String, sshSecret: String = "") async throws {
+        if let ssh = server.ssh, ssh.enabled { try ssh.validate(destination: server.host, port: server.port) }
+        if server.ssh?.enabled == true && (sshSecret.contains("\n") || sshSecret.contains("\r")) { throw DBError("SSH passwords and passphrases must not contain line breaks.") }
+        try Credentials.save(sshSecret, for: server.id, ssh: true)
         try Credentials.save(password, for: server.id)
         var updated = servers
         if let index = updated.firstIndex(where: { $0.id == server.id }) { updated[index] = server } else { updated.append(server) }
@@ -172,7 +175,7 @@ import SwiftUI
         do {
             let updated = servers.filter { $0.id != server.id }
             try JSONEncoder().encode(updated).write(to: file, options: [.atomic])
-            await workspaces[server.id]?.disconnect(); workspaces.removeValue(forKey: server.id); Credentials.delete(server.id)
+            await workspaces[server.id]?.disconnect(); workspaces.removeValue(forKey: server.id); Credentials.delete(server.id); Credentials.delete(server.id, ssh: true)
             servers = updated; if selected == server.id { selected = nil }
         } catch { self.error = error.localizedDescription }
     }

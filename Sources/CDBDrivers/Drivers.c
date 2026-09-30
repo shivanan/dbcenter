@@ -5,8 +5,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #define LIMIT 10000
-struct DBConnection { int kind; void *lib; void *handle; void *env; };
+struct DBConnection { int kind; void *lib; void *handle; void *env; char *tls_host; int tunnel_port; };
 static void *library(const char *name) {
     const char *roots[] = {"/opt/homebrew/lib", "/usr/local/lib", "/opt/homebrew/opt/libpq/lib", "/usr/local/opt/libpq/lib", NULL};
     char path[512];
@@ -21,7 +23,45 @@ static char *diagnostic(DBConnection *c, short type, void *handle) {
     if(SQLGetDiagRec && SQLGetDiagRec(type,handle,1,state,&native,message,2048,&size)>=0) return strdup((char*)message);
     return strdup("ODBC operation failed.");
 }
+// Stable public libmongoc APIs, runtime-loaded like the other adapters. Keep the URI's
+// original host for authentication and TLS, while every socket uses the local forward.
+typedef struct { uint32_t domain, code; char message[504]; } MongoError;
+static void *mongo_tunnel_stream(const void *uri,const void *host,void *data,void *error_ptr) {
+    DBConnection *c=data; MongoError *error=error_ptr; (void)host;
+    FN(void*,mongoc_socket_new,(int,int,int)); FN(int,mongoc_socket_connect,(void*,const struct sockaddr*,socklen_t,int64_t));
+    FN(void,mongoc_socket_destroy,(void*)); FN(void*,mongoc_stream_socket_new,(void*));
+    FN(void,mongoc_stream_destroy,(void*)); FN(int64_t,bson_get_monotonic_time,(void));
+    FN(_Bool,mongoc_uri_get_tls,(const void*));
+    FN(const void*,mongoc_ssl_opt_get_default,(void));
+    FN(void*,mongoc_stream_tls_new_with_hostname,(void*,const char*,const void*,int));
+    FN(_Bool,mongoc_stream_tls_handshake_block,(void*,const char*,int32_t,void*));
+    error->domain=2; error->code=1;
+    if(!mongoc_socket_new||!mongoc_socket_connect||!mongoc_socket_destroy||!mongoc_stream_socket_new||!mongoc_stream_destroy||!bson_get_monotonic_time||!mongoc_uri_get_tls){
+        snprintf(error->message,sizeof(error->message),"MongoDB driver lacks SSH transport APIs");return NULL;
+    }
+    void *sock=mongoc_socket_new(AF_INET,SOCK_STREAM,0);
+    struct sockaddr_in address={0}; address.sin_len=sizeof(address); address.sin_family=AF_INET;
+    address.sin_addr.s_addr=htonl(INADDR_LOOPBACK); address.sin_port=htons(c->tunnel_port);
+    if(!sock||mongoc_socket_connect(sock,(struct sockaddr*)&address,sizeof(address),bson_get_monotonic_time()+10000000)!=0){
+        if(sock)mongoc_socket_destroy(sock);snprintf(error->message,sizeof(error->message),"Cannot connect to MongoDB SSH tunnel");return NULL;
+    }
+    void *stream=mongoc_stream_socket_new(sock);
+    if(!stream){mongoc_socket_destroy(sock);snprintf(error->message,sizeof(error->message),"Cannot create MongoDB tunnel stream");return NULL;}
+    if(mongoc_uri_get_tls(uri)){
+        if(!mongoc_ssl_opt_get_default||!mongoc_stream_tls_new_with_hostname||!mongoc_stream_tls_handshake_block){
+            mongoc_stream_destroy(stream);snprintf(error->message,sizeof(error->message),"MongoDB driver lacks TLS transport APIs");return NULL;
+        }
+        void *tls=mongoc_stream_tls_new_with_hostname(stream,c->tls_host,mongoc_ssl_opt_get_default(),1);
+        if(!tls){mongoc_stream_destroy(stream);snprintf(error->message,sizeof(error->message),"Cannot create MongoDB TLS stream");return NULL;}
+        if(!mongoc_stream_tls_handshake_block(tls,c->tls_host,10000,error)){mongoc_stream_destroy(tls);return NULL;}
+        stream=tls;
+    }
+    return stream;
+}
 DBConnection *db_open(int kind,const char *connection,const char *host,int port,char **error) {
+    return db_open_tunneled(kind,connection,host,port,NULL,error);
+}
+DBConnection *db_open_tunneled(int kind,const char *connection,const char *host,int port,const char *tls_host,char **error) {
     DBConnection *c=calloc(1,sizeof(*c)); c->kind=kind;
     const char *libs[]={"libpq.dylib","libodbc.dylib","libmongoc-1.0.dylib","libhiredis.dylib"};
     c->lib=library(libs[kind]);
@@ -46,6 +86,12 @@ DBConnection *db_open(int kind,const char *connection,const char *host,int port,
         // mongoc_init is idempotent; never clean up process-global state while other sessions exist.
         mongoc_init(); c->handle=mongoc_client_new(connection);
         if(!c->handle){*error=strdup("Invalid MongoDB connection URI");db_close(c);return NULL;}
+        if(tls_host){
+            FN(void,mongoc_client_set_stream_initiator,(void*,void*(*)(const void*,const void*,void*,void*),void*));
+            NEED(mongoc_client_set_stream_initiator);
+            c->tls_host=strdup(tls_host);c->tunnel_port=port;
+            mongoc_client_set_stream_initiator(c->handle,mongo_tunnel_stream,c);
+        }
     }else{
         FN(void*,redisConnectWithTimeout,(const char*,int,struct timeval)); FN(int,redisSetTimeout,(void*,struct timeval));
         NEED(redisConnectWithTimeout); NEED(redisSetTimeout);
@@ -126,7 +172,7 @@ void db_close(DBConnection *c){
         else if(c->kind==2){FN(void,mongoc_client_destroy,(void*));if(mongoc_client_destroy&&c->handle)mongoc_client_destroy(c->handle);}
         else {FN(void,redisFree,(void*));if(redisFree&&c->handle)redisFree(c->handle);}
         // Keep driver code loaded: libmongoc maintains global initialization and TLS state.
-    }free(c);
+    }free(c->tls_host);free(c);
 }
 void db_result_free(DBResult *r){if(!r)return;for(int i=0;i<r->columns;i++)free(r->names[i]);for(int i=0;i<r->rows*r->columns;i++)free(r->cells[i]);free(r->names);free(r->cells);free(r->json);free(r->error);free(r);}
 void db_string_free(char *s){free(s);}

@@ -9,6 +9,7 @@ A native macOS database workbench written in SwiftUI and AppKit. Requires macOS 
 - Database inspector with 50-record previews and structure/details sheets.
 - Result grids with individual-cell copying, keyboard navigation, and CSV/JSON export.
 - Expandable AI query generation using database schema context, with global OpenAI key/model settings.
+- Optional SSH tunnels with password or private-key authentication, random local ports, and automatic cleanup.
 - macOS Keychain credentials, native menus, and documented keyboard shortcuts.
 
 ## Run
@@ -38,7 +39,7 @@ Drivers load at runtime from Apple Silicon and Intel Homebrew locations. Missing
 | SQL Server | unixODBC + Microsoft ODBC 18 | T-SQL, tabular results, affected row counts |
 | MongoDB | Native MongoDB C driver (1.x / 2.x) | JSON database commands, document grid, full Extended JSON reply |
 | Redis | Native hiredis 1.x | One command with quoted arguments, indexed scalar/array results |
-| InfluxDB | Foundation URLSession, InfluxDB 2 HTTP API | Flux, annotated CSV grid and raw response |
+| InfluxDB | Foundation URLSession / system libcurl for SSH, InfluxDB 2 HTTP API | Flux, annotated CSV grid and raw response |
 
 Driver API references: [libpq](https://www.postgresql.org/docs/current/libpq.html), [MongoDB commands](https://mongoc.org/libmongoc/current/mongoc_client_command_simple.html), [hiredis](https://redis.io/docs/latest/develop/clients/hiredis/issue-commands/), [InfluxDB query API](https://docs.influxdata.com/influxdb/v2/api/query/).
 
@@ -56,7 +57,23 @@ Click a result cell and press **⌘C** to copy its complete value without header
 
 Passwords and tokens are stored in macOS Keychain. Connection metadata is written atomically to `~/Library/Application Support/DBCenter/servers.json`. Query text and results remain in memory and are not persisted across app launches. Nothing is sent to a telemetry service.
 
-TLS is enabled by default for Postgres, SQL Server, MongoDB, and InfluxDB, with certificate validation. Turn it off explicitly for local servers that do not use TLS. Redis currently supports TCP only. Host fields take a hostname or IP address, not a URI. MongoDB SRV URIs, custom CA selection, client certificates, SSH tunnels, and Windows integrated authentication are not implemented.
+TLS is enabled by default for Postgres, SQL Server, MongoDB, and InfluxDB, with certificate validation. Turn it off explicitly for local servers that do not use TLS. Redis currently supports TCP only. Host fields take a hostname or IP address, not a URI. MongoDB SRV URIs, custom CA selection, client certificates, and Windows integrated authentication are not implemented.
+
+## SSH tunnels
+
+In **New Connection** or **Edit Connection**, enable **SSH tunnel** and enter the SSH host, port (default 22), and username. Choose **Password** or **SSH key file**. The native file picker can show hidden files such as those in `~/.ssh`; encrypted keys accept an optional passphrase.
+
+Keep the database's **Host** and **Port** set to the destination reachable **from the SSH server**. For example, use SSH host `bastion.example.com` and database host `127.0.0.1:5432` when Postgres runs on that SSH server, or `postgres.internal:5432` when it runs elsewhere on the private network. Enter host and port in their separate fields.
+
+DB Center starts macOS's built-in `/usr/bin/ssh`, authenticates, and forwards an available random port on **127.0.0.1 only** to the configured database host/port. Each workspace owns its tunnel. Switching sidebar servers preserves it; switching databases reuses it. Disconnecting, editing/removing the connection, failed initial database connection, or normal application termination closes the tunnel. If SSH drops, reconnect explicitly; requests do not fall back to a direct database connection.
+
+SSH passwords/passphrases use separate Keychain items (`com.dbcenter.ssh`). The app itself serves as OpenSSH's askpass helper: only the credential UUID, never the secret, is passed in the environment. Key paths and non-secret SSH settings are saved with the registration. Private keys are read from their selected location, not copied. Passwords/passphrases containing line breaks are unsupported.
+
+OpenSSH automatically remembers previously unknown host keys in `~/.ssh/known_hosts` and rejects changed keys (`StrictHostKeyChecking=accept-new`). Preload a verified host key there if first-use trust is unsuitable. DB Center ignores `~/.ssh/config`, uses the supplied password or key rather than an SSH agent, and does not support jump-host chains, interactive MFA, or agent forwarding. The SSH account must permit local TCP forwarding.
+
+**TLS remains a separate database setting.** Postgres and SQL Server retain certificate checks against the configured database hostname. MongoDB uses a custom native stream with the original TLS hostname and a direct connection to the selected node; replica-set discovery cannot route outside the tunnel. Tunneled InfluxDB uses macOS's native libcurl API to preserve HTTP Host, TLS SNI, and certificate verification while connecting to the local port. HTTP redirects and proxies are disabled for these tunneled requests. Redis remains TCP-only at the database layer; its connection to the SSH host is encrypted by SSH.
+
+Implementation references: [OpenSSH forwarding and authentication](https://man.openbsd.org/ssh), [MongoDB stream initiators](https://mongoc.org/libmongoc/current/mongoc_client_set_stream_initiator.html), [ODBC certificate hostnames](https://learn.microsoft.com/en-us/sql/connect/odbc/linux-mac/connection-string-keywords-and-data-source-names-dsns), [libcurl connection routing and TLS identity](https://curl.se/libcurl/c/CURLOPT_CONNECT_TO.html).
 
 ## AI query generation
 
@@ -186,12 +203,23 @@ With local Homebrew `postgresql@18`, `mongodb-community`, `redis`, and the clien
 ./scripts/test-integration.sh
 ```
 
+To include real SSH authentication and forwarding tests, install the test-only Python dependency in a virtual environment and run:
+
+```sh
+python3 -m venv /tmp/dbcenter-ssh-venv
+/tmp/dbcenter-ssh-venv/bin/pip install paramiko
+SSH_TEST_PYTHON=/tmp/dbcenter-ssh-venv/bin/python3 ./scripts/test-ssh-integration.sh
+```
+
+This adds a disposable loopback SSH fixture with generated keys, a test password, and isolated known-hosts files. It does not enable macOS Remote Login or authenticate system users. Password/key-passphrase tests use a fixture askpass helper; macOS Keychain prompts in the packaged app still need interactive verification.
+
 The script starts disposable servers in temporary directories, binds only to loopback on dedicated ports, and stops its processes on exit. It does not use or alter existing database data directories. Logs remain in temporary `dbcenter-tests.*` directories for diagnosis.
 
 Verified in this workspace:
 
 - Debug and release compilation and `.app` packaging.
-- All 39 automated tests passed in the latest full integration run, including object previews/details, name escaping, exports, cell copying, focus routing, highlighting, selection-only execution, and AI request/schema handling.
+- All 48 automated tests passed in the latest full integration run, including object previews/details, name escaping, exports, cell copying, focus routing, highlighting, selection-only execution, and AI request/schema handling.
+- SSH: password and encrypted/unencrypted key authentication, wrong-password and changed-host-key rejection, simultaneous tunnels, database switching, failure/disconnect cleanup, and Postgres/MongoDB/Redis/Influx fixture queries through a hostname resolved only by the SSH fixture. Live tunneled SQL Server and database TLS handshakes have not been integration-tested.
 - Live Postgres: queries, Unicode, NULL, errors, session persistence, database/object discovery.
 - Live MongoDB: insert/find commands, Unicode, malformed JSON, collection/database discovery.
 - Live Redis: commands, quoted values, errors, database isolation, database/key discovery.
@@ -206,6 +234,8 @@ Verified in this workspace:
 - `Sources/DBCenter/NativeViews.swift`: NSTextView, NSTableView, NSComboBox bridges.
 - `Sources/DBCenter/AppStore.swift`: saved registrations and per-server workspace lifecycle.
 - `Sources/DBCenter/DatabaseDriver.swift`: driver dispatch, metadata, HTTP API.
+- `Sources/DBCenter/SSHTunnel.swift`: OpenSSH lifecycle, configuration, and Keychain askpass entry point.
+- `Sources/CDBDrivers/HTTP.c`: system libcurl requests through SSH with the original TLS identity.
 - `Sources/DBCenter/Models.swift`: engine metadata, database Keychain credentials, result parsers.
 - `Sources/DBCenter/QueryExecution.swift` and `SyntaxHighlighter.swift`: selection extraction and engine-specific highlighting.
 - `Sources/DBCenter/WorkspaceFocus.swift`: native focus routing and keyboard commands.

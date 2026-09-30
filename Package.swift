@@ -5,7 +5,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [.executable(name: "DBCenter", targets: ["DBCenter"])],
     targets: [
-        .target(name: "CDBDrivers", linkerSettings: [.linkedLibrary("dl")]),
+        .target(name: "CDBDrivers", linkerSettings: [.linkedLibrary("dl"), .linkedLibrary("curl")]),
         .executableTarget(name: "DBCenter", dependencies: ["CDBDrivers"], swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "DBCenterTests", dependencies: ["DBCenter"])
     ]

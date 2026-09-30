@@ -9,35 +9,50 @@ final class DatabaseDriver: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.dbcenter.driver", qos: .userInitiated)
     private var handle: OpaquePointer?
     private var currentDatabase = ""
-    init(server: Server, password: String) { self.server = server; self.password = password }
-    deinit { if let handle { db_close(handle) } }
+    private var tunnel: SSHTunnel?
+    private let makeTunnel: @Sendable () -> SSHTunnel
+    init(server: Server, password: String, makeTunnel: @escaping @Sendable () -> SSHTunnel = { SSHTunnel() }) { self.server = server; self.password = password; self.makeTunnel = makeTunnel }
+    deinit { if let handle { db_close(handle) }; tunnel?.stop() }
     private func work<T>(_ operation: @escaping () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
             queue.async { do { continuation.resume(returning: try operation()) } catch { continuation.resume(throwing: error) } }
         }
     }
-    func close() async { _ = try? await work { self.closeNative() } }
+    func close() async { _ = try? await work { self.closeNative(); self.tunnel?.stop(); self.tunnel = nil } }
     private func closeNative() { if let handle { db_close(handle) }; handle = nil; currentDatabase = "" }
     static func pgEscape(_ s: String) -> String { "'" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'") + "'" }
     static func odbcEscape(_ s: String) -> String { "{" + s.replacingOccurrences(of: "}", with: "}}") + "}" }
+    private func ensureTunnel() throws {
+        guard let config = server.ssh, config.enabled else { return }
+        if let tunnel { try tunnel.check(); return }
+        let tunnel = makeTunnel()
+        try tunnel.start(config: config, destination: server.host, port: server.port, credentialID: server.id)
+        self.tunnel = tunnel
+    }
     private func openNative(database: String) throws {
+        try ensureTunnel()
         if handle != nil && (currentDatabase == database || server.engine == .mongo) { currentDatabase = database; return }
         closeNative()
         let s = server
+        let host = tunnel == nil ? s.host : "127.0.0.1"
+        let port = tunnel?.localPort ?? s.port
         var kind: Int32 = 0, connection = ""
         switch s.engine {
         case .postgres:
-            let pairs = ["host": s.host, "port": String(s.port), "user": s.username, "password": password, "dbname": database, "sslmode": s.tls ? "verify-full" : "disable", "connect_timeout": "10", "application_name": "DBCenter", "options": "-c statement_timeout=30000"]
+            var pairs = ["host": s.host, "port": String(port), "user": s.username, "password": password, "dbname": database, "sslmode": s.tls ? "verify-full" : "disable", "connect_timeout": "10", "application_name": "DBCenter", "options": "-c statement_timeout=30000"]
+            if tunnel != nil { pairs["hostaddr"] = host }
             connection = pairs.map { "\($0.key)=\(Self.pgEscape($0.value))" }.joined(separator: " ")
         case .sqlServer:
             kind = 1
-            connection = "Driver={ODBC Driver 18 for SQL Server};Server=\(Self.odbcEscape("\(s.host),\(s.port)"));Database=\(Self.odbcEscape(database));UID=\(Self.odbcEscape(s.username));PWD=\(Self.odbcEscape(password));Encrypt=\(s.tls ? "yes" : "no");TrustServerCertificate=no;APP=DBCenter;"
+            connection = "Driver={ODBC Driver 18 for SQL Server};Server=\(Self.odbcEscape("\(host),\(port)"));Database=\(Self.odbcEscape(database));UID=\(Self.odbcEscape(s.username));PWD=\(Self.odbcEscape(password));Encrypt=\(s.tls ? "yes" : "no");TrustServerCertificate=no;APP=DBCenter;"
+            if tunnel != nil { connection += "HostNameInCertificate=\(Self.odbcEscape(s.host));" }
         case .mongo:
             kind = 2
             var url = URLComponents(); url.scheme = "mongodb"; url.host = s.host; url.port = s.port
             if !s.username.isEmpty { url.user = s.username; url.password = password }
             url.path = "/" + database
             url.queryItems = [URLQueryItem(name: "authSource", value: s.authDatabase), URLQueryItem(name: "tls", value: s.tls ? "true" : "false"), URLQueryItem(name: "serverSelectionTimeoutMS", value: "10000"), URLQueryItem(name: "socketTimeoutMS", value: "30000"), URLQueryItem(name: "appName", value: "DBCenter")]
+            if tunnel != nil { url.queryItems?.append(URLQueryItem(name: "directConnection", value: "true")) }
             guard let uri = url.string else { throw DBError("Invalid MongoDB host or database.") }; connection = uri
         case .redis:
             kind = 3
@@ -45,7 +60,7 @@ final class DatabaseDriver: @unchecked Sendable {
         case .influx: return
         }
         var error: UnsafeMutablePointer<CChar>?
-        handle = db_open(kind, connection, s.host, Int32(s.port), &error)
+        handle = db_open_tunneled(kind, connection, host, Int32(port), tunnel == nil ? nil : s.host, &error)
         guard handle != nil else { let message = error.map { String(cString: $0) } ?? "Could not connect."; db_string_free(error); throw DBError(message) }
         currentDatabase = database
         do {
@@ -79,8 +94,10 @@ final class DatabaseDriver: @unchecked Sendable {
         return QueryResult(columns: columns, rows: rows, affected: r.affected, truncated: r.truncated != 0)
     }
     func connect(database: String) async throws {
-        if server.engine == .influx { _ = try await request(path: "/api/v2/buckets", query: [URLQueryItem(name: "org", value: server.organization), URLQueryItem(name: "limit", value: "1")]); return }
-        try await work { try self.openNative(database: database) }
+        do {
+            if server.engine == .influx { _ = try await request(path: "/api/v2/buckets", query: [URLQueryItem(name: "org", value: server.organization), URLQueryItem(name: "limit", value: "1")]); return }
+            try await work { try self.openNative(database: database) }
+        } catch { await close(); throw error }
     }
     func execute(_ query: String, database: String) async throws -> QueryResult {
         let start = Date()
@@ -145,6 +162,25 @@ final class DatabaseDriver: @unchecked Sendable {
         request.setValue("Token \(password)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.flux", forHTTPHeaderField: "Content-Type")
         request.setValue(body == nil ? "application/json" : "application/csv", forHTTPHeaderField: "Accept")
+        if server.ssh?.enabled == true {
+            guard !password.contains("\r"), !password.contains("\n") else { throw DBError("The InfluxDB token must not contain line breaks.") }
+            return try await work {
+                try self.ensureTunnel()
+                var count = 0, status = 0
+                var error: UnsafeMutablePointer<CChar>?
+                let pointer: UnsafeMutablePointer<CChar>? = (body ?? Data()).withUnsafeBytes { bytes in
+                    db_http_tunnel(url.absoluteString, Int32(self.tunnel!.localPort), self.password,
+                                   body == nil ? nil : bytes.bindMemory(to: CChar.self).baseAddress,
+                                   bytes.count, &count, &status, &error)
+                }
+                defer { db_string_free(pointer); db_string_free(error) }
+                if let error { throw DBError("InfluxDB tunnel request failed: " + String(cString: error)) }
+                guard let pointer else { throw DBError("No InfluxDB response.") }
+                let data = Data(bytes: pointer, count: count)
+                guard (200..<300).contains(status) else { throw DBError("InfluxDB request failed: \(String(decoding: data.prefix(2000), as: UTF8.self))") }
+                return data
+            }
+        }
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else { throw DBError("InfluxDB request failed: \(String(decoding: data.prefix(2000), as: UTF8.self))") }
         return data

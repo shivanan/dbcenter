@@ -33,6 +33,7 @@ struct Server: Identifiable, Codable, Equatable {
     var tls = true
     var organization = ""
     var authDatabase = "admin"
+    var ssh: SSHConfiguration?
     var endpoint: String { "\(host):\(port)" }
 }
 struct QueryResult: Sendable, Equatable {
@@ -48,22 +49,22 @@ struct DBError: LocalizedError { let message: String; var errorDescription: Stri
 func jsonString(_ s: String) -> String { String(data: try! JSONEncoder().encode(s), encoding: .utf8)! }
 
 enum Credentials {
-    private static func attributes(_ id: UUID) -> [String: Any] { [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "com.dbcenter.credentials", kSecAttrAccount as String: id.uuidString] }
-    static func save(_ password: String, for id: UUID) throws {
-        let query = attributes(id)
+    private static func attributes(_ id: UUID, ssh: Bool) -> [String: Any] { [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: ssh ? "com.dbcenter.ssh" : "com.dbcenter.credentials", kSecAttrAccount as String: id.uuidString] }
+    static func save(_ password: String, for id: UUID, ssh: Bool = false) throws {
+        let query = attributes(id, ssh: ssh)
         let data = Data(password.utf8)
         var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound { var item = query; item[kSecValueData as String] = data; item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked; status = SecItemAdd(item as CFDictionary, nil) }
         guard status == errSecSuccess else { throw DBError("Could not save credential in Keychain (\(status)).") }
     }
-    static func read(_ id: UUID) throws -> String {
-        var query = attributes(id); query[kSecReturnData as String] = true; query[kSecMatchLimit as String] = kSecMatchLimitOne
+    static func read(_ id: UUID, ssh: Bool = false) throws -> String {
+        var query = attributes(id, ssh: ssh); query[kSecReturnData as String] = true; query[kSecMatchLimit as String] = kSecMatchLimitOne
         var value: CFTypeRef?; let status = SecItemCopyMatching(query as CFDictionary, &value)
         if status == errSecItemNotFound { return "" }
         guard status == errSecSuccess, let data = value as? Data else { throw DBError("Could not read credential from Keychain (\(status)).") }
         return String(decoding: data, as: UTF8.self)
     }
-    static func delete(_ id: UUID) { SecItemDelete(attributes(id) as CFDictionary) }
+    static func delete(_ id: UUID, ssh: Bool = false) { SecItemDelete(attributes(id, ssh: ssh) as CFDictionary) }
 }
 
 enum QueryParser {

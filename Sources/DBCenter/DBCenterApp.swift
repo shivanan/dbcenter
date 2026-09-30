@@ -1,6 +1,6 @@
 import SwiftUI
 
-@main struct DBCenterApp: App {
+struct DBCenterApp: App {
     @StateObject private var store = AppStore()
     @StateObject private var aiSettings = AISettings()
     var body: some Scene {
@@ -223,6 +223,7 @@ struct InspectorView: View {
                 info("Host", workspace.server.host)
                 info("Port", String(workspace.server.port))
                 info("Transport", workspace.server.tls ? "TLS" : "TCP / HTTP")
+                if let ssh = workspace.server.ssh, ssh.enabled { info("SSH tunnel", "\(ssh.username)@\(ssh.host):\(ssh.port)") }
                 if !workspace.server.username.isEmpty { info("User", workspace.server.username) }
             }.padding(17)
             Divider()
@@ -256,6 +257,8 @@ struct ConnectionSheet: View {
     @Environment(\.dismiss) var dismiss
     @State var server: Server
     @State private var password = ""
+    @State private var ssh = SSHConfiguration()
+    @State private var sshSecret = ""
     @State private var error: String?
     @State private var saving = false
     @State private var credentialLoaded = false
@@ -282,14 +285,39 @@ struct ConnectionSheet: View {
                     if server.engine == .mongo { TextField("Auth database", text: $server.authDatabase) }
                     Label("Saved in your macOS Keychain", systemImage: "lock").font(.caption).foregroundStyle(.secondary)
                 }
+                Section("SSH tunnel") {
+                    Toggle("Enable SSH tunnel", isOn: $ssh.enabled)
+                    if ssh.enabled {
+                        TextField("SSH host", text: $ssh.host, prompt: Text("bastion.example.com"))
+                        TextField("SSH port", value: $ssh.port, format: .number.grouping(.never))
+                        TextField("SSH username", text: $ssh.username)
+                        Picker("Authentication", selection: $ssh.authentication) {
+                            Text("Password").tag(SSHConfiguration.Authentication.password)
+                            Text("SSH key file").tag(SSHConfiguration.Authentication.keyFile)
+                        }
+                        if ssh.authentication == .keyFile {
+                            HStack {
+                                TextField("Private key", text: $ssh.keyFile)
+                                Button("Choose…") {
+                                    let panel = NSOpenPanel()
+                                    panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+                                    panel.showsHiddenFiles = true; panel.message = "Choose your SSH private key"
+                                    if panel.runModal() == .OK, let url = panel.url { ssh.keyFile = url.path }
+                                }
+                            }
+                        }
+                        SecureField(ssh.authentication == .password ? "SSH password" : "Key passphrase (optional)", text: $sshSecret)
+                        Text("Database host and port are reached from the SSH server. Secrets are stored in Keychain. New SSH host keys are remembered automatically; changed keys are rejected.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }.formStyle(.grouped)
             if let error { Text(error).foregroundStyle(.red).font(.caption).textSelection(.enabled).padding(.horizontal, 24).padding(.bottom, 12) }
             Divider()
             HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction); Button(saving ? "Saving…" : "Save & Connect") { save() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saving || !valid) }.padding(18)
-        }.frame(width: 510, height: server.engine == .mongo ? 650 : 610)
-        .onAppear { do { password = try Credentials.read(server.id); credentialLoaded = true } catch { self.error = error.localizedDescription } }
+        }.frame(width: 550, height: 740)
+        .onAppear { do { password = try Credentials.read(server.id); ssh = server.ssh ?? SSHConfiguration(); sshSecret = try Credentials.read(server.id, ssh: true); credentialLoaded = true } catch { self.error = error.localizedDescription } }
         .onChange(of: server.engine) { _, engine in server.port = engine.port; server.database = engine.initialDatabase; server.tls = engine != .redis }
     }
     private var valid: Bool { credentialLoaded && !server.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !server.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (1...65535).contains(server.port) && (server.engine == .influx ? !server.organization.isEmpty : !server.database.isEmpty) }
-    private func save() { saving = true; error = nil; server.name = server.name.trimmingCharacters(in: .whitespacesAndNewlines); server.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines); Task { do { try await store.save(server, password: password) } catch { self.error = error.localizedDescription }; saving = false } }
+    private func save() { saving = true; error = nil; server.name = server.name.trimmingCharacters(in: .whitespacesAndNewlines); server.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines); Task { do { server.ssh = ssh; try await store.save(server, password: password, sshSecret: sshSecret) } catch { self.error = error.localizedDescription }; saving = false } }
 }
